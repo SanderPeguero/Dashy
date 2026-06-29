@@ -148,23 +148,49 @@ export default function App() {
   // ==========================================
   // INITIALIZATION AND LOAD TIME VERIFICATION
   // ==========================================
-  const loadDashboardData = async (targetMeterId) => {
+  const loadDashboardData = async (targetMeterId, isRefresh = false) => {
     try {
-      setLoading(true);
-      setSuggestedTariff(null);
-      
-      // Stage 1: Connect to Power Company API
-      setLoadingStage(`Consultando saldo del medidor ${targetMeterId} en CEPM...`);
-      const apiStatus = await fetchMeterStatus(targetMeterId);
-      setMeterStatus(apiStatus);
+      let activeTariff = parseFloat(localStorage.getItem(`dashy_tariff_rate_${targetMeterId}`) || '15.00');
 
-      // Stage 2: Connect to Database (Firebase or Local fallback)
+      // If not refreshing the same meter, clear the current readings/refills to avoid showing stale data from the previous meter
+      if (!isRefresh) {
+        setReadings([]);
+        setRefills([]);
+        setTariffRate(activeTariff);
+        setMeterStatus({
+          success: true,
+          realApi: false,
+          meterId: targetMeterId,
+          fechaBalance: 'Cargando...',
+          remainingBalance: 0,
+          balanceStr: 'Cargando...',
+          totalAccumulatedKwh: 0,
+          suspensionStr: 'Cargando...',
+          suspensionNum: 0,
+          corteDate: 'Cargando...',
+          status: 'checking'
+        });
+      }
+
+      // Show full screen splash loader only if it's the absolute first load of the application
+      const isInitialAppLoad = readings.length === 0 && meterList.length === 0 && !isRefresh;
+      if (isInitialAppLoad) {
+        setLoading(true);
+      }
+      
+      setSuggestedTariff(null);
+      setVerificationResult({
+        checked: false,
+        status: 'checking',
+        message: 'Cargando datos locales y Firebase...'
+      });
+
+      // Stage 1: Connect to Database (Firebase or Local fallback)
       setLoadingStage(isConfigValid ? 'Estableciendo conexión con Firebase Firestore...' : 'Cargando base de datos local...');
       
       let fetchedReadings = [];
       let fetchedRefills = [];
       let fetchedMeterList = [];
-      let activeTariff = parseFloat(localStorage.getItem(`dashy_tariff_rate_${targetMeterId}`) || '15.00');
       
       if (isConfigValid && db) {
         try {
@@ -226,112 +252,151 @@ export default function App() {
         localStorage.setItem('dashy_meter_list', JSON.stringify(fetchedMeterList));
       }
 
+      const sortedHistory = [...fetchedReadings].sort((a, b) => b.date.localeCompare(a.date));
+      const sortedRefills = [...fetchedRefills].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+
       setMeterList(fetchedMeterList);
       setTariffRate(activeTariff);
+      setReadings(sortedHistory);
+      setRefills(sortedRefills);
 
-      // Stage 3: Verification of current day's record
-      setLoadingStage('Verificando registro de consumo diario...');
-      const todayStr = new Date().toISOString().split('T')[0];
-      
-      // Sort desc
-      const sortedHistory = [...fetchedReadings].sort((a, b) => b.date.localeCompare(a.date));
-      const latestRecord = sortedHistory[0]; // Latest recorded measurement
-
-      // Check if this exact API update date has already been registered
-      const isAlreadyLogged = sortedHistory.some(r => r.fechaBalance === apiStatus.fechaBalance);
-
-      if (!apiStatus.realApi) {
-        // Fallback or offline: do NOT write new entries, just load existing database data
-        setReadings(sortedHistory);
-        setRefills([...fetchedRefills].sort((a, b) => b.timestamp.localeCompare(a.timestamp)));
-        setVerificationResult({
-          checked: true,
-          status: 'warning',
-          message: `No se pudo conectar con CEPM. Mostrando datos locales offline.`
-        });
-      } else if (isAlreadyLogged) {
-        // CEPM balance is still the same as our logged records, no need to add duplicate entries
-        setReadings(sortedHistory);
-        setRefills([...fetchedRefills].sort((a, b) => b.timestamp.localeCompare(a.timestamp)));
-        setVerificationResult({
-          checked: true,
-          status: 'verified',
-          message: `Lectura actualizada. Medidor: ${apiStatus.remainingBalance} kWh. No hay consumos nuevos registrados en la compañía eléctrica.`
+      // Initialize meter status state with latest known record so user sees immediate results
+      if (sortedHistory.length > 0) {
+        const latest = sortedHistory[0];
+        setMeterStatus({
+          success: true,
+          realApi: true,
+          meterId: targetMeterId,
+          fechaBalance: latest.fechaBalance,
+          remainingBalance: latest.balanceKwh,
+          balanceStr: `${latest.balanceKwh.toFixed(1)} kWh`,
+          totalAccumulatedKwh: latest.lecturaKwh,
+          suspensionStr: `${latest.suspensionKwh.toFixed(1)} kWh`,
+          suspensionNum: latest.suspensionKwh,
+          corteDate: latest.corteDate,
+          status: latest.balanceKwh > 5 ? 'Active' : latest.balanceKwh > 0 ? 'Low Balance' : 'Suspended'
         });
       } else {
-        // Calculate consumption differentially from the latest record of a PREVIOUS day
-        const previousDayRecord = sortedHistory.find(r => r.date !== todayStr);
-        let kwhConsumed = 0;
-        if (previousDayRecord && apiStatus.totalAccumulatedKwh > 0 && previousDayRecord.lecturaKwh > 0) {
-          kwhConsumed = parseFloat((apiStatus.totalAccumulatedKwh - previousDayRecord.lecturaKwh).toFixed(2));
-        }
-        kwhConsumed = Math.max(0, kwhConsumed);
-        const cost = parseFloat((kwhConsumed * activeTariff).toFixed(2));
-
-        const todayRecord = {
-          date: todayStr,
-          timestamp: new Date().toISOString(),
-          fechaBalance: apiStatus.fechaBalance,
+        setMeterStatus({
+          success: true,
+          realApi: false,
           meterId: targetMeterId,
-          balanceKwh: apiStatus.remainingBalance,
-          lecturaKwh: apiStatus.totalAccumulatedKwh > 0 ? apiStatus.totalAccumulatedKwh : (previousDayRecord?.lecturaKwh || 0),
-          suspensionKwh: apiStatus.suspensionNum,
-          corteDate: apiStatus.corteDate,
-          kwhConsumed: kwhConsumed,
-          cost: cost,
-          tariffRate: activeTariff,
-          verified: true
-        };
-
-        // Write to Firestore if config is valid
-        if (isConfigValid && db) {
-          try {
-            await setDoc(doc(db, 'meters', targetMeterId, 'readings', todayStr), todayRecord);
-          } catch (err) {
-            console.error("Error storing reading in Firestore:", err);
-          }
-        }
-        
-        const localReadings = getLocalReadings(targetMeterId);
-        const updatedLocal = [todayRecord, ...localReadings.filter(r => r.date !== todayStr)];
-        localStorage.setItem(`dashy_readings_${targetMeterId}`, JSON.stringify(updatedLocal));
-        
-        const newlySorted = [...updatedLocal].sort((a, b) => b.date.localeCompare(a.date));
-        setReadings(newlySorted);
-        const sortedRefills = [...fetchedRefills].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-        setRefills(sortedRefills);
-        
-        // Auto-detect recharge tariff suggestion if balance increased
-        if (latestRecord && apiStatus.remainingBalance > latestRecord.balanceKwh) {
-          const kwhDiff = apiStatus.remainingBalance - latestRecord.balanceKwh;
-          const latestRefill = sortedRefills[0];
-          if (latestRefill && kwhDiff > 1) { // more than 1 kWh change to avoid small noise
-            const estimatedRate = parseFloat((latestRefill.amount / kwhDiff).toFixed(2));
-            if (estimatedRate > 0 && estimatedRate < 100) {
-              setSuggestedTariff({
-                rate: estimatedRate,
-                amount: latestRefill.amount,
-                kwh: kwhDiff
-              });
-            }
-          }
-        }
-
-        setVerificationResult({
-          checked: true,
-          status: 'verified',
-          message: `Nuevo registro de consumo guardado. Consumido: ${kwhConsumed} kWh (RD$ ${cost.toLocaleString()}).`
+          fechaBalance: 'N/A',
+          remainingBalance: 0,
+          balanceStr: '0.0 kWh',
+          totalAccumulatedKwh: 0,
+          suspensionStr: '0.0 kWh',
+          suspensionNum: 0,
+          corteDate: 'N/A',
+          status: 'Suspended'
         });
       }
 
+      // Disappear loading screen instantly as the local/cached data is now rendered
+      setLoading(false);
+
+      // Stage 2: Sync in background with power company
+      setVerificationResult({
+        checked: true,
+        status: 'syncing',
+        message: 'Sincronizando últimas mediciones en vivo con CEPM...'
+      });
+
+      try {
+        const apiStatus = await fetchMeterStatus(targetMeterId);
+        
+        if (!apiStatus.realApi) {
+          setVerificationResult({
+            checked: true,
+            status: 'warning',
+            message: `No se pudo conectar con CEPM. Mostrando últimos datos sincronizados.`
+          });
+          return;
+        }
+
+        setMeterStatus(apiStatus);
+
+        const isAlreadyLogged = sortedHistory.some(r => r.fechaBalance === apiStatus.fechaBalance);
+
+        if (isAlreadyLogged) {
+          setVerificationResult({
+            checked: true,
+            status: 'verified',
+            message: `Lectura sincronizada y al día. Saldo: ${apiStatus.remainingBalance} kWh.`
+          });
+        } else {
+          const todayStr = new Date().toISOString().split('T')[0];
+          const previousDayRecord = sortedHistory.find(r => r.date !== todayStr);
+          let kwhConsumed = 0;
+          if (previousDayRecord && apiStatus.totalAccumulatedKwh > 0 && previousDayRecord.lecturaKwh > 0) {
+            kwhConsumed = parseFloat((apiStatus.totalAccumulatedKwh - previousDayRecord.lecturaKwh).toFixed(2));
+          }
+          kwhConsumed = Math.max(0, kwhConsumed);
+          const cost = parseFloat((kwhConsumed * activeTariff).toFixed(2));
+
+          const todayRecord = {
+            date: todayStr,
+            timestamp: new Date().toISOString(),
+            fechaBalance: apiStatus.fechaBalance,
+            meterId: targetMeterId,
+            balanceKwh: apiStatus.remainingBalance,
+            lecturaKwh: apiStatus.totalAccumulatedKwh > 0 ? apiStatus.totalAccumulatedKwh : (previousDayRecord?.lecturaKwh || 0),
+            suspensionKwh: apiStatus.suspensionNum,
+            corteDate: apiStatus.corteDate,
+            kwhConsumed: kwhConsumed,
+            cost: cost,
+            tariffRate: activeTariff,
+            verified: true
+          };
+
+          if (isConfigValid && db) {
+            await setDoc(doc(db, 'meters', targetMeterId, 'readings', todayStr), todayRecord).catch(console.error);
+          }
+          
+          const localReadings = getLocalReadings(targetMeterId);
+          const updatedLocal = [todayRecord, ...localReadings.filter(r => r.date !== todayStr)];
+          localStorage.setItem(`dashy_readings_${targetMeterId}`, JSON.stringify(updatedLocal));
+          
+          const newlySorted = [...updatedLocal].sort((a, b) => b.date.localeCompare(a.date));
+          setReadings(newlySorted);
+
+          // Auto-detect recharge tariff suggestion
+          if (sortedHistory.length > 0 && apiStatus.remainingBalance > sortedHistory[0].balanceKwh) {
+            const kwhDiff = apiStatus.remainingBalance - sortedHistory[0].balanceKwh;
+            if (sortedRefills.length > 0 && kwhDiff > 1) {
+              const latestRefill = sortedRefills[0];
+              const estimatedRate = parseFloat((latestRefill.amount / kwhDiff).toFixed(2));
+              if (estimatedRate > 0 && estimatedRate < 100) {
+                setSuggestedTariff({
+                  rate: estimatedRate,
+                  amount: latestRefill.amount,
+                  kwh: kwhDiff
+                });
+              }
+            }
+          }
+
+          setVerificationResult({
+            checked: true,
+            status: 'verified',
+            message: `Sincronización exitosa. Nueva lectura de hoy registrada (${kwhConsumed} kWh).`
+          });
+        }
+      } catch (apiError) {
+        console.error("Error connecting to CEPM in background:", apiError);
+        setVerificationResult({
+          checked: true,
+          status: 'warning',
+          message: 'No se pudo conectar con CEPM. Mostrando últimos datos sincronizados.'
+        });
+      }
     } catch (err) {
       console.error("Error loading dashboard data:", err);
       setVerificationResult({
         checked: true,
         status: 'failed',
-        message: 'Error al establecer contacto con los servidores de CEPM.'
+        message: 'Error crítico al inicializar base de datos.'
       });
-    } finally {
       setLoading(false);
     }
   };
@@ -728,26 +793,30 @@ export default function App() {
           <div className={`p-4 border rounded-2xl flex items-start sm:items-center justify-between gap-4 transition-all duration-300 backdrop-blur-md
             ${verificationResult.status === 'verified' 
               ? 'bg-emerald-500/5 border-emerald-500/20 text-emerald-400 glow-emerald' 
-              : verificationResult.status === 'warning'
-                ? 'bg-amber-500/5 border-amber-500/20 text-amber-400 glow-indigo'
-                : 'bg-red-500/5 border-red-500/20 text-red-400'}`}
+              : verificationResult.status === 'syncing'
+                ? 'bg-indigo-500/5 border-indigo-500/20 text-indigo-400 glow-indigo'
+                : verificationResult.status === 'warning'
+                  ? 'bg-amber-500/5 border-amber-500/20 text-amber-400 glow-indigo'
+                  : 'bg-red-500/5 border-red-500/20 text-red-400'}`}
           >
             <div className="flex items-center gap-3">
               {verificationResult.status === 'verified' ? (
                 <CheckCircle2 className="w-5 h-5 shrink-0" />
+              ) : verificationResult.status === 'syncing' ? (
+                <RefreshCw className="w-5 h-5 shrink-0 animate-spin text-indigo-400" />
               ) : (
                 <AlertTriangle className="w-5 h-5 shrink-0" />
               )}
               <div className="text-xs font-semibold leading-relaxed font-sans">
                 <span className="font-bold uppercase tracking-wider block sm:inline mr-2">
-                  {meterStatus?.realApi ? 'Conectado a CEPM:' : 'Simulando datos:'}
+                  {verificationResult.status === 'syncing' ? 'Sincronizando:' : meterStatus?.realApi ? 'Conectado a CEPM:' : 'Simulando datos:'}
                 </span>
                 {verificationResult.message} {meterStatus?.error && <span className="text-[10px] text-zinc-500">({meterStatus.error})</span>}
               </div>
             </div>
             
             <button 
-              onClick={() => loadDashboardData(currentMeterId)}
+              onClick={() => loadDashboardData(currentMeterId, true)}
               className="p-1 rounded-lg border border-transparent hover:border-[#222226] bg-zinc-950/20 hover:bg-[#18181b] hover:text-white transition-all cursor-pointer shrink-0"
               title="Volver a verificar medidor"
             >
@@ -1276,6 +1345,71 @@ export default function App() {
                 )}
               </tbody>
             </table>
+          </div>
+        </div>
+
+        {/* Versions and Updates Section */}
+        <div className="p-6 bg-[#121214]/60 backdrop-blur-xl border border-[#222226] rounded-2xl glow-indigo space-y-6">
+          <div className="border-b border-[#222226] pb-4 flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <h3 className="text-lg font-bold text-white font-sans flex items-center gap-2">
+                <FileText className="w-5 h-5 text-indigo-400" />
+                Historial de Versiones y Mejoras
+              </h3>
+              <p className="text-xs text-zinc-500 font-sans mt-0.5">Control de versiones de la aplicación y registro de fallos corregidos</p>
+            </div>
+            <span className="text-xs font-bold px-2.5 py-1 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-400">
+              Versión Actual: v1.3.0
+            </span>
+          </div>
+
+          <div className="space-y-6">
+            {/* Version 1.3.0 */}
+            <div className="relative pl-6 border-l border-indigo-500/30 space-y-2">
+              <div className="absolute left-[-5px] top-1.5 w-2.5 h-2.5 rounded-full bg-indigo-500 ring-4 ring-indigo-500/20" />
+              <div className="flex items-center gap-2 flex-wrap">
+                <h4 className="text-sm font-bold text-white">Versión 1.3.0 - Optimización de Rendimiento y UX</h4>
+                <span className="text-[9px] font-bold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Reciente</span>
+              </div>
+              <ul className="space-y-1.5 text-xs text-zinc-400 list-disc list-inside">
+                <li><span className="font-semibold text-zinc-300">Carga Optimista Instantánea</span>: El dashboard se inicializa en milisegundos con los datos históricos de Firestore/LocalStorage antes de consultar a CEPM.</li>
+                <li><span className="font-semibold text-zinc-300">Sincronización Asíncrona en Segundo Plano</span>: Eliminado el splash screen molesto de bloqueo al actualizar. Ahora se actualiza en segundo plano mostrando un spinner discreto inline en el banner.</li>
+                <li><span className="font-semibold text-zinc-300">Limpieza Síncrona de Transición</span>: Al cambiar de medidor, la interfaz limpia síncronamente todas las métricas, saldo y gráficos viejos a un estado "Cargando..." antes de hidratar el nuevo medidor.</li>
+                <li><span className="font-semibold text-zinc-300">Prevención de Fallback a Mockups</span>: Si la API de la distribuidora falla, el sistema muestra una advertencia sin corromper el historial real con datos simulados.</li>
+              </ul>
+            </div>
+
+            {/* Version 1.2.0 */}
+            <div className="relative pl-6 border-l border-zinc-800 space-y-2">
+              <div className="absolute left-[-5px] top-1.5 w-2.5 h-2.5 rounded-full bg-zinc-700 ring-4 ring-zinc-700/20" />
+              <h4 className="text-sm font-bold text-white">Versión 1.2.0 - Aislamiento Multimedidor y Firebase</h4>
+              <ul className="space-y-1.5 text-xs text-zinc-400 list-disc list-inside">
+                <li><span className="font-semibold text-zinc-300">Soporte Multimedidor Completo</span>: Estructuración de subcolecciones aisladas en Firestore para dar soporte a múltiples medidores sin colisión de datos.</li>
+                <li><span className="font-semibold text-zinc-300">Tarifa Personalizada por Medidor</span>: Cada medidor cuenta con su propia tarifa configurable en Firestore para ajustarse a diferentes zonas del país.</li>
+                <li><span className="font-semibold text-zinc-300">Timestamps Reales de Lectura</span>: Integración de la hora real de última lectura de la distribuidora (`fechaBalance`) en tarjetas KPI y tabla.</li>
+              </ul>
+            </div>
+
+            {/* Version 1.1.0 */}
+            <div className="relative pl-6 border-l border-zinc-800 space-y-2">
+              <div className="absolute left-[-5px] top-1.5 w-2.5 h-2.5 rounded-full bg-zinc-700 ring-4 ring-zinc-700/20" />
+              <h4 className="text-sm font-bold text-white">Versión 1.1.0 - Consumo Diferencial y Tarifa Sugerida</h4>
+              <ul className="space-y-1.5 text-xs text-zinc-400 list-disc list-inside">
+                <li><span className="font-semibold text-zinc-300">Cálculo Diferencial de Consumo</span>: Consumo de hoy calculado como diferencia entre lecturas históricas, evitando registros duplicados.</li>
+                <li><span className="font-semibold text-zinc-300">Sugerencia de Tarifas de Recarga</span>: Detección automática del incremento de saldo para sugerir la tarifa real implícita en base a la recarga de pesos.</li>
+                <li><span className="font-semibold text-zinc-300">Comparativas Temporales de Gráficas</span>: Vistas de gráficos dinámicos Día, Mes y Año con etiquetas X formateadas.</li>
+              </ul>
+            </div>
+
+            {/* Version 1.0.0 */}
+            <div className="relative pl-6 space-y-2">
+              <div className="absolute left-[-5px] top-1.5 w-2.5 h-2.5 rounded-full bg-zinc-700 ring-4 ring-zinc-700/20" />
+              <h4 className="text-sm font-bold text-white">Versión 1.0.0 - Lanzamiento Inicial</h4>
+              <ul className="space-y-1.5 text-xs text-zinc-400 list-disc list-inside">
+                <li><span className="font-semibold text-zinc-300">Scraping de Balance</span>: Conectividad y parseo de HTML en tiempo real con la oficina virtual de CEPM.</li>
+                <li><span className="font-semibold text-zinc-300">UI Dashboard</span>: Diseño de interfaz futurista oscuro con glassmorphism, tarjetas de saldo prepago y gráficos interactivos.</li>
+              </ul>
+            </div>
           </div>
         </div>
 
